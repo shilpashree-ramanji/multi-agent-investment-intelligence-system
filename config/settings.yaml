@@ -1,0 +1,11 @@
+# Non-secret defaults for local development. Runtime loading is not wired yet.
+application:
+  environment: development
+
+logging:
+  level: INFO
+
+trading:
+  paper_trading: true
+  live_trading_enabled: false
+  require_human_approval: true

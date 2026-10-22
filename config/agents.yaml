@@ -1,0 +1,20 @@
+# Agent roles are disabled until their contracts and workflows are implemented.
+roles:
+  discovery:
+    enabled: false
+    responsibility: Identify candidate opportunities from approved data sources.
+  research:
+    enabled: false
+    responsibility: Gather and summarize traceable company and market evidence.
+  strategies:
+    enabled: false
+    responsibility: Evaluate candidates using separately approved strategy definitions.
+  review:
+    enabled: false
+    responsibility: Challenge unsupported claims and conflicting evidence.
+  risk:
+    enabled: false
+    responsibility: Apply deterministic risk checks that agent output cannot override.
+
+human_approval:
+  required_before_investment_action: true

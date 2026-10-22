@@ -1,0 +1,20 @@
+# Logical roles only. Provider and model choices remain undecided.
+routing:
+  criteria:
+    - task_complexity
+    - required_capability
+    - evaluation_results
+    - latency
+    - cost
+  fallback: human_review
+
+roles:
+  research:
+    provider: null
+    model: null
+  review:
+    provider: null
+    model: null
+  extraction:
+    provider: null
+    model: null
