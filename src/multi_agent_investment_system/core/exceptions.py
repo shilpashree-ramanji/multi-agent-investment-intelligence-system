@@ -26,6 +26,14 @@ class MarketDataProviderError(StockInvestmentError):
     """Raised when a market-data provider request or response fails."""
 
 
+class CandidateUniverseProviderError(StockInvestmentError):
+    """Raised when the authorized equity-universe provider fails."""
+
+
+class FundamentalsProviderError(StockInvestmentError):
+    """Raised when a company-fundamentals provider fails."""
+
+
 class StorageError(StockInvestmentError):
     """Raised when local persistence fails without exposing database details."""
 

@@ -60,6 +60,12 @@ class FundamentalMetric:
                     f"Fundamental metric {field_name} must be non-empty when provided"
                 )
 
+        if self.provenance is not None and not isinstance(self.provenance, Mapping):
+            raise DataValidationError("Fundamental metric provenance must be a mapping")
+        if not isinstance(self.source_references, tuple):
+            raise DataValidationError(
+                "Fundamental metric source references must be a tuple"
+            )
         if any(not isinstance(reference, str) or not reference.strip()
                for reference in self.source_references):
             raise DataValidationError(
@@ -86,6 +92,11 @@ class CompanyFundamentalsPeriod:
     period_end: date | None = None
     basis: FinancialStatementBasis | None = None
     company_name: str | None = None
+    company_id: str | None = None
+    company_id_type: str | None = None
+    source_record_id: str | None = None
+    published_at: datetime | None = None
+    revision_of: str | None = None
     source_references: tuple[str, ...] = ()
     source_metadata: Mapping[str, object] | None = None
 
@@ -117,7 +128,14 @@ class CompanyFundamentalsPeriod:
                 "Fundamentals period start must not be after period end"
             )
 
-        for field_name in ("reporting_period", "company_name"):
+        for field_name in (
+            "reporting_period",
+            "company_name",
+            "company_id",
+            "company_id_type",
+            "source_record_id",
+            "revision_of",
+        ):
             value = getattr(self, field_name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise DataValidationError(
@@ -125,14 +143,36 @@ class CompanyFundamentalsPeriod:
                     "when provided"
                 )
 
+        if self.published_at is not None and not isinstance(
+            self.published_at, datetime
+        ):
+            raise DataValidationError(
+                "Fundamentals publication time must be a datetime"
+            )
+        if self.published_at is not None and (
+            self.published_at.tzinfo is None
+            or self.published_at.utcoffset() is None
+        ):
+            raise DataValidationError(
+                "Fundamentals publication timestamp must be timezone-aware"
+            )
+
         if self.basis is not None and not isinstance(
             self.basis, FinancialStatementBasis
         ):
             raise DataValidationError("Fundamentals statement basis is invalid")
+        if not isinstance(self.metrics, tuple):
+            raise DataValidationError("Fundamentals metrics must be a tuple")
         if any(not isinstance(metric, FundamentalMetric) for metric in self.metrics):
             raise DataValidationError(
                 "Fundamentals metrics must contain FundamentalMetric records"
             )
+        if self.source_metadata is not None and not isinstance(
+            self.source_metadata, Mapping
+        ):
+            raise DataValidationError("Fundamentals source metadata must be a mapping")
+        if not isinstance(self.source_references, tuple):
+            raise DataValidationError("Fundamentals source references must be a tuple")
         if any(not isinstance(reference, str) or not reference.strip()
                for reference in self.source_references):
             raise DataValidationError(

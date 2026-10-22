@@ -69,6 +69,23 @@ def test_fundamentals_preserve_reporting_period_basis_and_provenance() -> None:
     assert record.source_metadata is source_metadata
 
 
+def test_fundamentals_preserve_company_and_filing_revision_identity() -> None:
+    published_at = datetime(2026, 5, 1, 9, tzinfo=UTC)
+    record = _fundamentals(
+        company_id="INE002A01018",
+        company_id_type="ISIN",
+        source_record_id="filing-revision-2",
+        published_at=published_at,
+        revision_of="filing-revision-1",
+    )
+
+    assert record.company_id == "INE002A01018"
+    assert record.company_id_type == "ISIN"
+    assert record.source_record_id == "filing-revision-2"
+    assert record.published_at is published_at
+    assert record.revision_of == "filing-revision-1"
+
+
 def test_standalone_basis_is_preserved() -> None:
     record = _fundamentals(basis=FinancialStatementBasis.STANDALONE)
 
@@ -113,6 +130,8 @@ def test_missing_and_unavailable_are_distinct_and_not_imputed() -> None:
         {"retrieved_at": datetime(2026, 10, 22, 12)},
         {"period_start": date(2026, 4, 1), "period_end": date(2026, 3, 31)},
         {"metrics": ("Revenue",)},
+        {"published_at": datetime(2026, 10, 22, 12)},
+        {"revision_of": " "},
     ],
 )
 def test_invalid_fundamentals_records_are_rejected(

@@ -192,6 +192,56 @@ class SQLiteDailyCandleStore:
             results.append(record)
         return tuple(results)
 
+    def latest_trading_date(self, symbol: str) -> date | None:
+        """Return the latest stored date for a symbol, or ``None`` if empty."""
+
+        if not symbol.strip():
+            raise DataValidationError("Market-data symbol must not be empty")
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT MAX(trading_date) AS latest_date FROM daily_ohlcv "
+                "WHERE symbol = ?",
+                (symbol.strip(),),
+            ).fetchone()
+        except sqlite3.Error:
+            raise StorageError("Could not read local market data") from None
+        finally:
+            connection.close()
+
+        latest_date = row["latest_date"]
+        if latest_date is None:
+            return None
+        try:
+            return date.fromisoformat(latest_date)
+        except (TypeError, ValueError):
+            raise StorageError("Stored market data contains an invalid date") from None
+
+    def count_daily_candles(self, symbol: str, start: date, end: date) -> int:
+        """Count stored candles for an inclusive symbol and date range."""
+
+        if not symbol.strip():
+            raise DataValidationError("Market-data symbol must not be empty")
+        if start > end:
+            raise DataValidationError("Market-data start must not be after end")
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count FROM daily_ohlcv
+                WHERE symbol = ? AND trading_date >= ? AND trading_date <= ?
+                """,
+                (symbol.strip(), start.isoformat(), end.isoformat()),
+            ).fetchone()
+        except sqlite3.Error:
+            raise StorageError("Could not read local market data") from None
+        finally:
+            connection.close()
+
+        return int(row["row_count"])
+
     def _connect(self) -> sqlite3.Connection:
         try:
             self._database_path.parent.mkdir(parents=True, exist_ok=True)
