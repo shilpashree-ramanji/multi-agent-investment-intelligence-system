@@ -16,6 +16,10 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.9",
 ]
+openai = ["openai>=1.66.0"]
+
+[project.scripts]
+multi-agent-investment-system = "multi_agent_investment_system.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

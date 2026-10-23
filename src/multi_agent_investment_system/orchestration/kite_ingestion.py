@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
@@ -14,6 +15,9 @@ from multi_agent_investment_system.core.exceptions import DataValidationError
 def _require_text(value: object, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise DataValidationError(f"{name} must not be empty")
+
+
+_TRADING_SYMBOL_PATTERN = re.compile(r"[A-Z0-9]+(?:[&-][A-Z0-9]+)*(?:\.(?:NS|BO))?")
 
 
 class KiteWorkflowStatus(StrEnum):
@@ -81,7 +85,13 @@ class KiteIngestionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class KiteIngestionRequest:
-    """Immutable caller-supplied task; agents cannot rewrite its parameters."""
+    """Immutable caller-supplied task; agents cannot rewrite its parameters.
+
+    Symbols use uppercase ASCII alphanumeric segments, optionally separated
+    by ``&`` or ``-``. Yahoo-style ``.NS`` and ``.BO`` suffixes and numeric
+    exchange scrip codes are syntactically accepted. This checks format only;
+    it does not prove an exchange listing exists or is supported by Kite.
+    """
 
     run_id: str
     task_id: str
@@ -92,8 +102,8 @@ class KiteIngestionRequest:
     def __post_init__(self) -> None:
         for name in ("run_id", "task_id", "symbol"):
             _require_text(getattr(self, name), name.replace("_", " ").title())
-        if any(character.isspace() for character in self.symbol):
-            raise DataValidationError("Kite symbol must not contain whitespace")
+        if _TRADING_SYMBOL_PATTERN.fullmatch(self.symbol) is None:
+            raise DataValidationError("Kite symbol has an unsupported format")
         for name in ("start", "end"):
             value = getattr(self, name)
             if not isinstance(value, date) or isinstance(value, datetime):

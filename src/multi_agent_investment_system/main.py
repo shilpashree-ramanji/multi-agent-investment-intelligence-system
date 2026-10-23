@@ -1,20 +1,8 @@
-"""Local command-line entry point; this module makes no external calls."""
+"""CLI entry point; external calls require explicit live mode confirmation."""
 
 from __future__ import annotations
 
-import logging
-
-from multi_agent_investment_system.core.logging_config import configure_logging
-
-
-def main() -> int:
-    """Report that the application package is initialized."""
-    configure_logging()
-    logging.getLogger(__name__).info(
-        "Multi-Agent Investment System initialized"
-    )
-    return 0
-
+from multi_agent_investment_system.orchestration.kite_cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())
