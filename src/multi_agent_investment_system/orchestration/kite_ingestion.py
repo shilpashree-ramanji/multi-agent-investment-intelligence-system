@@ -9,7 +9,14 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 
-from multi_agent_investment_system.core.exceptions import DataValidationError
+from multi_agent_investment_system.core.exceptions import (
+    DataValidationError,
+    MarketDataProviderDiagnostic,
+)
+from multi_agent_investment_system.llm.provider import (
+    ModelOutputRejectionCategory,
+    ModelProviderDiagnostic,
+)
 
 
 def _require_text(value: object, name: str) -> None:
@@ -43,6 +50,7 @@ class KiteWorkflowErrorCode(StrEnum):
     STORAGE_ERROR = "storage_error"
     INGESTION_ERROR = "ingestion_error"
     DATA_QUALITY_REVIEW = "data_quality_review"
+    ITERATION_BUDGET_EXHAUSTED = "iteration_budget_exhausted"
 
 
 class WorkerTaskStatus(StrEnum):
@@ -66,11 +74,143 @@ class KiteCoverageReason(StrEnum):
     EXECUTION_NOT_SUCCESSFUL = "execution_not_successful"
 
 
+class KiteCollectionAction(StrEnum):
+    """Actions and outcomes recorded by a bounded collection run."""
+
+    INSPECT_COVERAGE = "inspect_coverage"
+    COLLECT_RANGE = "collect_range"
+    RETRY_COLLECTION = "retry_collection"
+    COMPLETE = "complete"
+    ESCALATE = "escalate"
+    REJECTED_MODEL_OUTPUT = "rejected_model_output"
+
+
+_SAFE_ACTION_TRACE_DESCRIPTIONS = {
+    KiteCollectionAction.INSPECT_COVERAGE: (
+        "Local stored coverage was inspected.",
+        "Stored dates and candle quality were observed.",
+    ),
+    KiteCollectionAction.COLLECT_RANGE: (
+        "A bounded collection action was authorized.",
+        "The assigned range is retrieved, validated, and persisted.",
+    ),
+    KiteCollectionAction.RETRY_COLLECTION: (
+        "A bounded retry action was authorized.",
+        "The assigned range is retried within workflow limits.",
+    ),
+    KiteCollectionAction.COMPLETE: (
+        "Completion followed deterministic verification.",
+        "The verified result is reported without claiming full session coverage.",
+    ),
+    KiteCollectionAction.ESCALATE: (
+        "The workflow was escalated for review.",
+        "No further collection proceeds automatically.",
+    ),
+    KiteCollectionAction.REJECTED_MODEL_OUTPUT: (
+        "The model proposal failed deterministic validation.",
+        "No unauthorized operation executes.",
+    ),
+}
+
+
+def safe_action_trace_descriptions(
+    action: KiteCollectionAction,
+) -> tuple[str, str]:
+    """Return fixed report text; never place model prose into action traces."""
+
+    if not isinstance(action, KiteCollectionAction):
+        raise DataValidationError("Collection action is invalid")
+    return _SAFE_ACTION_TRACE_DESCRIPTIONS[action]
+
+
+@dataclass(frozen=True, slots=True)
+class KiteDataCoverageObservation:
+    """Sanitized local coverage and quality facts supplied to the model."""
+
+    stored_dates: tuple[date, ...]
+    valid_count: int
+    incomplete_count: int
+    invalid_count: int
+    source_capabilities: tuple[str, ...] = ("daily_ohlcv", "historical_range")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stored_dates, tuple) or any(
+            not isinstance(item, date) or isinstance(item, datetime)
+            for item in self.stored_dates
+        ):
+            raise DataValidationError("Coverage observation dates are malformed")
+        if tuple(sorted(set(self.stored_dates))) != self.stored_dates:
+            raise DataValidationError("Coverage observation dates are not unique")
+        counts = (self.valid_count, self.incomplete_count, self.invalid_count)
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in counts
+        ):
+            raise DataValidationError("Coverage observation counts are malformed")
+        if sum(counts) != len(self.stored_dates):
+            raise DataValidationError(
+                "Coverage dates and quality counts do not reconcile"
+            )
+        if not isinstance(self.source_capabilities, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.source_capabilities
+        ):
+            raise DataValidationError("Source capabilities are malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class KiteCollectionActionTrace:
+    """Auditable action and deterministic tool authorization outcome."""
+
+    iteration: int
+    action: KiteCollectionAction
+    reason: str
+    expected_outcome: str
+    authorized: bool
+    executed: bool
+    outcome_code: str
+    counts: KiteIngestionCounts | None = None
+    rejection_category: ModelOutputRejectionCategory | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.iteration, bool)
+            or not isinstance(self.iteration, int)
+            or self.iteration < 1
+        ):
+            raise DataValidationError("Collection iteration is invalid")
+        if not isinstance(self.action, KiteCollectionAction):
+            raise DataValidationError("Collection action is invalid")
+        for name in ("reason", "expected_outcome", "outcome_code"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or len(value) > 400:
+                raise DataValidationError(
+                    f"Collection {name.replace('_', ' ')} is invalid"
+                )
+        if not isinstance(self.authorized, bool) or not isinstance(self.executed, bool):
+            raise DataValidationError("Collection action flags are malformed")
+        if self.executed and not self.authorized:
+            raise DataValidationError("An unauthorized collection action was executed")
+        if self.counts is not None and not isinstance(self.counts, KiteIngestionCounts):
+            raise DataValidationError("Collection action counts are malformed")
+        if self.rejection_category is not None and (
+            not isinstance(
+                self.rejection_category, ModelOutputRejectionCategory
+            )
+            or self.action is not KiteCollectionAction.REJECTED_MODEL_OUTPUT
+            or self.authorized
+            or self.executed
+        ):
+            raise DataValidationError("Collection rejection category is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class KiteIngestionPolicy:
     """Caller-configured bound on the requested inclusive calendar range."""
 
     maximum_calendar_days: int
+    maximum_iterations: int = 5
+    maximum_collection_attempts: int = 2
 
     def __post_init__(self) -> None:
         if (
@@ -81,6 +221,14 @@ class KiteIngestionPolicy:
             raise DataValidationError(
                 "Maximum calendar days must be a positive integer"
             )
+        for name in ("maximum_iterations", "maximum_collection_attempts"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise DataValidationError(
+                    f"{name.replace('_', ' ').title()} must be positive"
+                )
+        if self.maximum_collection_attempts > self.maximum_iterations:
+            raise DataValidationError("Collection attempts exceed iteration limit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,16 +389,29 @@ class KiteWorkerTaskResult:
     counts: KiteIngestionCounts | None = None
     evidence: tuple[KiteMarketDataEvidence, ...] = ()
     error_code: KiteWorkflowErrorCode | None = None
+    retryable: bool = False
+    market_data_diagnostic: MarketDataProviderDiagnostic | None = None
     coverage_status: KiteCoverageStatus = KiteCoverageStatus.NOT_ASSESSED
     coverage_reasons: tuple[KiteCoverageReason, ...] = (
         KiteCoverageReason.EXECUTION_NOT_SUCCESSFUL,
     )
+    model_provider_diagnostic: ModelProviderDiagnostic | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.run_id, "Worker result run ID")
         _require_text(self.task_id, "Worker result task ID")
         if not isinstance(self.status, WorkerTaskStatus):
             raise DataValidationError("Worker result status is invalid")
+        if not isinstance(self.retryable, bool):
+            raise DataValidationError("Worker retryability flag is invalid")
+        if self.model_provider_diagnostic is not None and not isinstance(
+            self.model_provider_diagnostic, ModelProviderDiagnostic
+        ):
+            raise DataValidationError("Worker model diagnostic is malformed")
+        if self.market_data_diagnostic is not None and not isinstance(
+            self.market_data_diagnostic, MarketDataProviderDiagnostic
+        ):
+            raise DataValidationError("Worker market-data diagnostic is malformed")
         if not isinstance(self.coverage_status, KiteCoverageStatus):
             raise DataValidationError("Worker coverage status is invalid")
         if not isinstance(self.coverage_reasons, tuple) or any(
@@ -297,6 +458,23 @@ class KiteWorkerTaskResult:
             self.error_code, KiteWorkflowErrorCode
         ):
             raise DataValidationError("Worker error code is invalid")
+        if self.model_provider_diagnostic is not None and (
+            self.status is not WorkerTaskStatus.FAILED
+            or self.error_code is not KiteWorkflowErrorCode.MODEL_PROVIDER_ERROR
+        ):
+            raise DataValidationError("Worker model diagnostic has no model error")
+        if self.market_data_diagnostic is not None and (
+            self.status is not WorkerTaskStatus.FAILED
+            or self.error_code is not KiteWorkflowErrorCode.MARKET_DATA_ERROR
+        ):
+            raise DataValidationError(
+                "Worker market-data diagnostic has no market-data error"
+            )
+        if self.retryable and (
+            self.status is not WorkerTaskStatus.FAILED
+            or self.error_code is not KiteWorkflowErrorCode.MARKET_DATA_ERROR
+        ):
+            raise DataValidationError("Only failed market-data requests may be retried")
 
     @property
     def has_data_quality_issues(self) -> bool:
@@ -310,7 +488,11 @@ class KiteWorkerTaskResult:
 _ALLOWED_TRANSITIONS = {
     KiteWorkflowStatus.PENDING: frozenset({KiteWorkflowStatus.COORDINATING}),
     KiteWorkflowStatus.COORDINATING: frozenset(
-        {KiteWorkflowStatus.ASSIGNED, KiteWorkflowStatus.FAILED}
+        {
+            KiteWorkflowStatus.ASSIGNED,
+            KiteWorkflowStatus.FAILED,
+            KiteWorkflowStatus.ESCALATED,
+        }
     ),
     KiteWorkflowStatus.ASSIGNED: frozenset({KiteWorkflowStatus.WORKER_RUNNING}),
     KiteWorkflowStatus.WORKER_RUNNING: frozenset(
@@ -318,6 +500,8 @@ _ALLOWED_TRANSITIONS = {
     ),
     KiteWorkflowStatus.REVIEWING: frozenset(
         {
+            KiteWorkflowStatus.COORDINATING,
+            KiteWorkflowStatus.WORKER_RUNNING,
             KiteWorkflowStatus.COMPLETED,
             KiteWorkflowStatus.ESCALATED,
             KiteWorkflowStatus.FAILED,
@@ -339,6 +523,10 @@ class KiteIngestionWorkflowState:
     assignments: tuple[KiteIngestionAssignment, ...] = ()
     worker_result: KiteWorkerTaskResult | None = None
     error_code: KiteWorkflowErrorCode | None = None
+    initial_observation: KiteDataCoverageObservation | None = None
+    final_observation: KiteDataCoverageObservation | None = None
+    action_trace: tuple[KiteCollectionActionTrace, ...] = ()
+    model_provider_diagnostic: ModelProviderDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, KiteIngestionRequest):
@@ -383,6 +571,17 @@ class KiteIngestionWorkflowState:
             self.transitions
         ):
             raise DataValidationError("Worker result is absent from workflow history")
+        for name in ("initial_observation", "final_observation"):
+            observation = getattr(self, name)
+            if observation is not None and not isinstance(
+                observation, KiteDataCoverageObservation
+            ):
+                raise DataValidationError("Workflow coverage observation is malformed")
+        if not isinstance(self.action_trace, tuple) or any(
+            not isinstance(item, KiteCollectionActionTrace)
+            for item in self.action_trace
+        ):
+            raise DataValidationError("Workflow action trace is malformed")
         if (
             self.status
             in {
@@ -390,7 +589,6 @@ class KiteIngestionWorkflowState:
                 KiteWorkflowStatus.WORKER_RUNNING,
                 KiteWorkflowStatus.REVIEWING,
                 KiteWorkflowStatus.COMPLETED,
-                KiteWorkflowStatus.ESCALATED,
             }
             and not self.assignments
         ):
@@ -400,7 +598,6 @@ class KiteIngestionWorkflowState:
             in {
                 KiteWorkflowStatus.REVIEWING,
                 KiteWorkflowStatus.COMPLETED,
-                KiteWorkflowStatus.ESCALATED,
             }
             and self.worker_result is None
         ):
@@ -416,13 +613,28 @@ class KiteIngestionWorkflowState:
             KiteWorkflowStatus.ESCALATED,
         }:
             raise DataValidationError("Workflow error code is invalid for this state")
+        if self.model_provider_diagnostic is not None and (
+            not isinstance(self.model_provider_diagnostic, ModelProviderDiagnostic)
+            or self.status is not KiteWorkflowStatus.FAILED
+            or self.error_code is not KiteWorkflowErrorCode.MODEL_PROVIDER_ERROR
+        ):
+            raise DataValidationError("Workflow model diagnostic is invalid")
         if self.status is KiteWorkflowStatus.COMPLETED and (
             self.worker_result is None
             or self.worker_result.status is not WorkerTaskStatus.SUCCEEDED
             or self.worker_result.has_data_quality_issues
             or self.error_code is not None
+            or self.worker_result.counts is None
+            or self.worker_result.counts.valid != self.worker_result.counts.upserted
+            or self.final_observation is None
+            or self.final_observation.incomplete_count
+            or self.final_observation.invalid_count
+            or len(self.final_observation.stored_dates)
+            != self.worker_result.counts.stored
         ):
-            raise DataValidationError("Completed workflow has an unsuccessful result")
+            raise DataValidationError(
+                "Completed workflow lacks verified persistence or has quality issues"
+            )
 
     def transition(
         self,
@@ -431,6 +643,10 @@ class KiteIngestionWorkflowState:
         assignment: KiteIngestionAssignment | None = None,
         worker_result: KiteWorkerTaskResult | None = None,
         error_code: KiteWorkflowErrorCode | None = None,
+        initial_observation: KiteDataCoverageObservation | None = None,
+        final_observation: KiteDataCoverageObservation | None = None,
+        action_trace: KiteCollectionActionTrace | None = None,
+        model_provider_diagnostic: ModelProviderDiagnostic | None = None,
     ) -> KiteIngestionWorkflowState:
         """Return a new state only when the transition and attached data are valid."""
 
@@ -453,6 +669,24 @@ class KiteIngestionWorkflowState:
                 raise DataValidationError("Worker result is malformed")
         if error_code is not None and not isinstance(error_code, KiteWorkflowErrorCode):
             raise DataValidationError("Workflow error code is invalid")
+        if initial_observation is not None and not isinstance(
+            initial_observation, KiteDataCoverageObservation
+        ):
+            raise DataValidationError("Workflow coverage observation is malformed")
+        if final_observation is not None and not isinstance(
+            final_observation, KiteDataCoverageObservation
+        ):
+            raise DataValidationError("Workflow coverage observation is malformed")
+        if action_trace is not None and not isinstance(
+            action_trace, KiteCollectionActionTrace
+        ):
+            raise DataValidationError("Workflow action trace is malformed")
+        if model_provider_diagnostic is not None and (
+            not isinstance(model_provider_diagnostic, ModelProviderDiagnostic)
+            or status is not KiteWorkflowStatus.FAILED
+            or error_code is not KiteWorkflowErrorCode.MODEL_PROVIDER_ERROR
+        ):
+            raise DataValidationError("Workflow model diagnostic is invalid")
         return replace(
             self,
             status=status,
@@ -464,4 +698,23 @@ class KiteIngestionWorkflowState:
             ),
             worker_result=worker_result or self.worker_result,
             error_code=error_code,
+            initial_observation=(initial_observation or self.initial_observation),
+            final_observation=(final_observation or self.final_observation),
+            action_trace=(
+                (*self.action_trace, action_trace)
+                if action_trace is not None
+                else self.action_trace
+            ),
+            model_provider_diagnostic=(
+                model_provider_diagnostic or self.model_provider_diagnostic
+            ),
         )
+
+    def record_action(
+        self, action_trace: KiteCollectionActionTrace
+    ) -> KiteIngestionWorkflowState:
+        """Append an already-authorized bounded action without changing status."""
+
+        if not isinstance(action_trace, KiteCollectionActionTrace):
+            raise DataValidationError("Workflow action trace is malformed")
+        return replace(self, action_trace=(*self.action_trace, action_trace))

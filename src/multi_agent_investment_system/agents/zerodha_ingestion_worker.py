@@ -8,6 +8,7 @@ from datetime import date, datetime
 from multi_agent_investment_system.agents._structured_output import parse_action
 from multi_agent_investment_system.core.exceptions import (
     DataValidationError,
+    MarketDataProviderDiagnostic,
     MarketDataProviderError,
     StorageError,
 )
@@ -18,11 +19,14 @@ from multi_agent_investment_system.data.ingestion import (
 from multi_agent_investment_system.llm.provider import (
     ChatMessage,
     ModelProvider,
+    ModelProviderDiagnostic,
+    ModelProviderError,
     ModelRequest,
 )
 from multi_agent_investment_system.orchestration.kite_ingestion import (
     KiteCoverageReason,
     KiteCoverageStatus,
+    KiteDataCoverageObservation,
     KiteIngestionAssignment,
     KiteIngestionCounts,
     KiteIngestionPolicy,
@@ -39,7 +43,7 @@ _WORKER_SCHEMA = json.dumps(
         "additionalProperties": False,
         "required": ["action", "task_id"],
         "properties": {
-            "action": {"const": "execute_ingestion"},
+            "action": {"enum": ["execute_ingestion"]},
             "task_id": {"type": "string"},
         },
     },
@@ -59,6 +63,29 @@ class ZerodhaIngestionWorkerAgent:
         self._model_provider = model_provider
         self._ingestion_service = ingestion_service
         self._policy = policy
+
+    async def observe_coverage(
+        self, request: KiteIngestionRequest
+    ) -> KiteDataCoverageObservation:
+        """Inspect and revalidate local coverage without contacting Kite."""
+
+        if not isinstance(request, KiteIngestionRequest):
+            raise DataValidationError("Worker request is malformed")
+        request.validate_policy(self._policy)
+        coverage = await self._ingestion_service.inspect_coverage(
+            request.symbol, request.start, request.end
+        )
+        return KiteDataCoverageObservation(
+            stored_dates=coverage.stored_dates,
+            valid_count=coverage.valid_count,
+            incomplete_count=coverage.incomplete_count,
+            invalid_count=coverage.invalid_count,
+            source_capabilities=(
+                "source:kite_connect",
+                "daily_ohlcv",
+                "historical_range",
+            ),
+        )
 
     async def execute(
         self,
@@ -116,10 +143,18 @@ class ZerodhaIngestionWorkerAgent:
         )
         try:
             response = await self._model_provider.generate(model_request)
-        except Exception:
+        except Exception as error:
+            diagnostic = (
+                error.diagnostic
+                if isinstance(error, ModelProviderError)
+                else ModelProviderDiagnostic.from_exception_class(
+                    type(error).__name__
+                )
+            )
             return self._failure(
                 request,
                 KiteWorkflowErrorCode.MODEL_PROVIDER_ERROR,
+                model_provider_diagnostic=diagnostic,
             )
         try:
             parse_action(
@@ -133,20 +168,26 @@ class ZerodhaIngestionWorkerAgent:
                 KiteWorkflowErrorCode.INVALID_MODEL_OUTPUT,
             )
 
+        market_data_diagnostic: MarketDataProviderDiagnostic | None = None
         try:
-            result = await self._ingestion_service.ingest_incremental(
-                request.symbol,
-                request.start,
-                request.end,
+            # Re-read the requested bounded range so a model-authorized repair
+            # can fill historical gaps. SQLite upserts keep repeat runs idempotent.
+            result = await self._ingestion_service.ingest(
+                request.symbol, request.start, request.end
             )
         except DataValidationError:
             error_code = KiteWorkflowErrorCode.VALIDATION_ERROR
-        except MarketDataProviderError:
+            retryable = False
+        except MarketDataProviderError as error:
             error_code = KiteWorkflowErrorCode.MARKET_DATA_ERROR
+            retryable = error.retryable
+            market_data_diagnostic = error.diagnostic
         except StorageError:
             error_code = KiteWorkflowErrorCode.STORAGE_ERROR
+            retryable = False
         except Exception:
             error_code = KiteWorkflowErrorCode.INGESTION_ERROR
+            retryable = False
         else:
             classified_records = (
                 *result.extraction_result.valid_records,
@@ -176,7 +217,16 @@ class ZerodhaIngestionWorkerAgent:
                     KiteCoverageReason.HISTORICAL_INTERVALS_NOT_VERIFIED,
                 ),
             )
-        return self._failure(request, error_code)
+        return self._failure(
+            request,
+            error_code,
+            retryable=retryable,
+            market_data_diagnostic=(
+                market_data_diagnostic
+                if error_code is KiteWorkflowErrorCode.MARKET_DATA_ERROR
+                else None
+            ),
+        )
 
     @staticmethod
     def _evidence(
@@ -207,6 +257,10 @@ class ZerodhaIngestionWorkerAgent:
     def _failure(
         request: KiteIngestionRequest,
         error_code: KiteWorkflowErrorCode,
+        *,
+        retryable: bool = False,
+        model_provider_diagnostic: ModelProviderDiagnostic | None = None,
+        market_data_diagnostic: MarketDataProviderDiagnostic | None = None,
     ) -> KiteWorkerTaskResult:
         """Create a failure result without retaining provider/model error text."""
 
@@ -215,4 +269,7 @@ class ZerodhaIngestionWorkerAgent:
             task_id=request.task_id,
             status=WorkerTaskStatus.FAILED,
             error_code=error_code,
+            retryable=retryable,
+            model_provider_diagnostic=model_provider_diagnostic,
+            market_data_diagnostic=market_data_diagnostic,
         )

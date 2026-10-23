@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 
 from multi_agent_investment_system.core.exceptions import (
     DataValidationError,
+    MarketDataErrorCategory,
     MarketDataProviderError,
     StorageError,
 )
@@ -55,6 +56,48 @@ class DailyMarketDataIngestionResult:
         return len(self.extraction_result.invalid_records)
 
 
+@dataclass(frozen=True, slots=True)
+class DailyMarketDataCoverage:
+    """Read-only stored-record quality and date observations for one range."""
+
+    symbol: str
+    start: date
+    end: date
+    stored_dates: tuple[date, ...]
+    valid_count: int
+    incomplete_count: int
+    invalid_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise DataValidationError("Coverage symbol must not be empty")
+        if (
+            not isinstance(self.start, date)
+            or isinstance(self.start, datetime)
+            or not isinstance(self.end, date)
+            or isinstance(self.end, datetime)
+            or self.start > self.end
+        ):
+            raise DataValidationError("Coverage date range is invalid")
+        if not isinstance(self.stored_dates, tuple) or any(
+            not isinstance(item, date) or isinstance(item, datetime)
+            for item in self.stored_dates
+        ):
+            raise DataValidationError("Coverage dates are malformed")
+        if tuple(sorted(set(self.stored_dates))) != self.stored_dates:
+            raise DataValidationError("Coverage dates are not unique and ordered")
+        counts = (self.valid_count, self.incomplete_count, self.invalid_count)
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in counts
+        ):
+            raise DataValidationError("Coverage quality counts are malformed")
+        if sum(counts) != len(self.stored_dates):
+            raise DataValidationError(
+                "Coverage dates and quality counts do not reconcile"
+            )
+
+
 class DailyMarketDataIngestionService:
     """Connect existing retrieval/validation to local SQLite persistence."""
 
@@ -65,6 +108,39 @@ class DailyMarketDataIngestionService:
     ) -> None:
         self._extraction_service = extraction_service
         self._store = store
+
+    async def inspect_coverage(
+        self, symbol: str, start: date, end: date
+    ) -> DailyMarketDataCoverage:
+        """Read back and revalidate local records without making provider calls."""
+
+        self._validate_request(symbol, start, end)
+        try:
+            records = await asyncio.to_thread(
+                self._store.fetch_daily_candles, symbol, start, end
+            )
+        except (DataValidationError, StorageError):
+            raise
+        except Exception:
+            raise StorageError("Could not inspect stored market data") from None
+
+        classified = normalize_and_validate_daily_candles(records)
+        dates = tuple(
+            sorted(
+                record["trading_date"]
+                for record in records
+                if isinstance(record.get("trading_date"), date)
+            )
+        )
+        return DailyMarketDataCoverage(
+            symbol=symbol,
+            start=start,
+            end=end,
+            stored_dates=dates,
+            valid_count=len(classified.valid_records),
+            incomplete_count=len(classified.incomplete_records),
+            invalid_count=len(classified.invalid_records),
+        )
 
     async def ingest(
         self, symbol: str, start: date, end: date
@@ -135,9 +211,17 @@ class DailyMarketDataIngestionService:
                 )
             except DataValidationError:
                 raise
+            except MarketDataProviderError as error:
+                raise MarketDataProviderError(
+                    "Daily market-data retrieval failed",
+                    retryable=error.retryable,
+                    category=error.diagnostic.category,
+                    http_status=error.diagnostic.http_status,
+                ) from None
             except Exception:
                 raise MarketDataProviderError(
-                    "Daily market-data retrieval failed"
+                    "Daily market-data retrieval failed",
+                    category=MarketDataErrorCategory.UNEXPECTED_EXTRACTION_ERROR,
                 ) from None
 
             try:

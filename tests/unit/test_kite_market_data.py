@@ -13,7 +13,10 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from multi_agent_investment_system.core.configuration import KiteConnectCredentials
-from multi_agent_investment_system.core.exceptions import MarketDataProviderError
+from multi_agent_investment_system.core.exceptions import (
+    MarketDataErrorCategory,
+    MarketDataProviderError,
+)
 from multi_agent_investment_system.data.service import DailyMarketDataExtractionService
 from multi_agent_investment_system.tools import kite_market_data
 from multi_agent_investment_system.tools.kite_authentication import KiteAccessToken
@@ -54,9 +57,7 @@ def _mock_urlopen(monkeypatch: pytest.MonkeyPatch, candles: list[object]):
         if urlparse(request.full_url).path == "/instruments/NSE":
             return FakeResponse(gzip.compress(_NSE_CSV))
         return FakeResponse(
-            json.dumps(
-                {"status": "success", "data": {"candles": candles}}
-            ).encode()
+            json.dumps({"status": "success", "data": {"candles": candles}}).encode()
         )
 
     monkeypatch.setattr(kite_market_data, "urlopen", fake_urlopen)
@@ -72,9 +73,7 @@ def test_resolves_exact_nse_equity_and_maps_canonical_daily_candle(
     )
 
     records = asyncio.run(
-        _provider().get_daily_candles(
-            "ACME", date(2026, 1, 2), date(2026, 1, 2)
-        )
+        _provider().get_daily_candles("ACME", date(2026, 1, 2), date(2026, 1, 2))
     )
 
     historical_request = requests[1][0]
@@ -121,9 +120,7 @@ def test_date_bounds_are_inclusive_and_out_of_range_candles_are_filtered(
     )
 
     records = asyncio.run(
-        _provider().get_daily_candles(
-            "ACME", date(2026, 1, 1), date(2026, 1, 2)
-        )
+        _provider().get_daily_candles("ACME", date(2026, 1, 1), date(2026, 1, 2))
     )
 
     query = parse_qs(urlparse(requests[1][0].full_url).query)
@@ -141,9 +138,7 @@ def test_empty_candles_are_a_successful_empty_result(
     _mock_urlopen(monkeypatch, [])
 
     records = asyncio.run(
-        _provider().get_daily_candles(
-            "ACME", date(2026, 1, 1), date(2026, 1, 2)
-        )
+        _provider().get_daily_candles("ACME", date(2026, 1, 1), date(2026, 1, 2))
     )
 
     assert records == ()
@@ -155,9 +150,7 @@ def test_missing_candle_fields_reach_shared_pipeline_as_incomplete(
     _mock_urlopen(monkeypatch, [["2026-01-02T00:00:00+05:30", 100, 110, 95]])
     service = DailyMarketDataExtractionService(_provider())
 
-    result = asyncio.run(
-        service.extract("ACME", date(2026, 1, 2), date(2026, 1, 2))
-    )
+    result = asyncio.run(service.extract("ACME", date(2026, 1, 2), date(2026, 1, 2)))
 
     assert len(result.incomplete_records) == 1
     assert result.incomplete_records[0].record["close"] is None
@@ -182,12 +175,14 @@ def test_malformed_historical_responses_raise_provider_error(
 
     monkeypatch.setattr(kite_market_data, "urlopen", fake_urlopen)
 
-    with pytest.raises(MarketDataProviderError, match="response"):
+    with pytest.raises(MarketDataProviderError, match="response") as raised:
         asyncio.run(
-            _provider().get_daily_candles(
-                "ACME", date(2026, 1, 1), date(2026, 1, 2)
-            )
+            _provider().get_daily_candles("ACME", date(2026, 1, 1), date(2026, 1, 2))
         )
+    assert (
+        raised.value.diagnostic.category
+        is MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE
+    )
 
 
 def test_unknown_symbol_does_not_guess_a_token(
@@ -195,14 +190,16 @@ def test_unknown_symbol_does_not_guess_a_token(
 ) -> None:
     requests = _mock_urlopen(monkeypatch, [])
 
-    with pytest.raises(MarketDataProviderError, match="not found"):
+    with pytest.raises(MarketDataProviderError, match="not found") as raised:
         asyncio.run(
-            _provider().get_daily_candles(
-                "UNKNOWN", date(2026, 1, 1), date(2026, 1, 2)
-            )
+            _provider().get_daily_candles("UNKNOWN", date(2026, 1, 1), date(2026, 1, 2))
         )
 
     assert len(requests) == 1
+    assert (
+        raised.value.diagnostic.category
+        is MarketDataErrorCategory.INSTRUMENT_RESOLUTION_ERROR
+    )
 
 
 def test_api_failure_is_sanitized_and_not_converted_to_empty(
@@ -221,11 +218,36 @@ def test_api_failure_is_sanitized_and_not_converted_to_empty(
 
     with pytest.raises(MarketDataProviderError) as raised:
         asyncio.run(
-            _provider().get_daily_candles(
-                "ACME", date(2026, 1, 1), date(2026, 1, 2)
-            )
+            _provider().get_daily_candles("ACME", date(2026, 1, 1), date(2026, 1, 2))
         )
 
     assert str(raised.value) == "Kite market-data request failed with HTTP status 403"
     assert _ACCESS_TOKEN not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.retryable is False
+    assert raised.value.diagnostic.to_dict() == {
+        "category": "http_error",
+        "http_status": 403,
+    }
+    assert _ACCESS_TOKEN not in repr(raised.value.diagnostic)
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"), [(429, True), (503, True), (401, False)]
+)
+def test_http_status_sets_only_sanitized_retryability(
+    monkeypatch: pytest.MonkeyPatch, status: int, retryable: bool
+) -> None:
+    def fail(request, timeout):
+        raise HTTPError(request.full_url, status, "provider detail", hdrs=None, fp=None)
+
+    monkeypatch.setattr(kite_market_data, "urlopen", fail)
+    with pytest.raises(MarketDataProviderError) as raised:
+        asyncio.run(
+            _provider().get_daily_candles("ACME", date(2026, 1, 1), date(2026, 1, 2))
+        )
+
+    assert raised.value.retryable is retryable
+    assert "provider detail" not in str(raised.value)
+    assert raised.value.diagnostic.category is MarketDataErrorCategory.HTTP_ERROR
+    assert raised.value.diagnostic.http_status == status

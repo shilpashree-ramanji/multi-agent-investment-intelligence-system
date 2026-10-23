@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date
 
-from multi_agent_investment_system.core.exceptions import MarketDataProviderError
+from multi_agent_investment_system.core.exceptions import (
+    MarketDataErrorCategory,
+    MarketDataProviderError,
+)
 from multi_agent_investment_system.tools.market_data import MarketDataProvider
 
 
@@ -26,6 +29,7 @@ class RequestedSymbolGuard:
         for record in records:
             if not isinstance(record, Mapping) or record.get("symbol") != symbol:
                 raise MarketDataProviderError(
-                    "Kite market-data response contained a mismatched symbol"
+                    "Kite market-data response contained a mismatched symbol",
+                    category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
                 )
         return records

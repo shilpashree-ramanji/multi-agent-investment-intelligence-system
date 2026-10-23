@@ -80,9 +80,9 @@ Every substantial feature will be developed on a feature branch, tested, reviewe
 
 ## 8. Current Implementation Status
 
-**Phase:** Initial repository structure.
+**Phase:** Market-data collection foundation.
 
-The provider-neutral package boundaries, foundational contracts, YAML configuration templates, and offline unit tests are in place. Provider integrations, agent implementations, LangGraph workflows, RAG retrieval, persistence, API endpoints, and the four investment strategies are not yet implemented.
+The repository includes a Kite Connect historical daily-candle adapter, deterministic OHLCV validation, SQLite persistence, incremental ingestion services, and a bounded Coordinator/Worker workflow. The Coordinator now selects from a small allow-listed action set using stored-coverage and execution observations; deterministic policy authorizes each action. This is a prototype data-collection workflow, not a strategy agent or an investment recommendation system. Exchange-session coverage remains unverified because there is no configured trading calendar or provider coverage guarantee. The four strategy agents, fundamentals/news integrations, and trading execution are not implemented.
 
 ## 9. Technology and Configuration
 
@@ -98,15 +98,22 @@ Use Python 3.12 or newer. Install the project and its already-declared developme
 python -m pip install -e ".[dev]"
 ```
 
-Run the application initialization command, tests, and lint check with:
+Run the initialization command, safe CLI modes, tests, and lint check with:
 
 ```bash
 python -m multi_agent_investment_system.main
+python -m multi_agent_investment_system.main --mode dry-run --symbol RELIANCE --start 2026-10-19 --end 2026-10-23
 python -m pytest
 python -m ruff check .
 ```
 
-Configuration templates are in `config/`. They contain no credentials and are not loaded by the CLI yet. `.env.example` remains a credential-free template; paper trading defaults to enabled, and live trading defaults to disabled.
+The CLI reads configuration from the process environment; it does not load `.env` or the YAML templates. For a live, read-only data collection, configure `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_ACCESS_TOKEN`, `OPENAI_API_KEY`, and `KITE_INGESTION_MAXIMUM_CALENDAR_DAYS` locally, then explicitly pass both live opt-ins:
+
+```bash
+python -m multi_agent_investment_system.main --mode live --confirm-live --symbol RELIANCE --start 2026-10-19 --end 2026-10-23
+```
+
+Live mode may call OpenAI for structured Coordinator/Worker decisions and Kite for daily market data. It does not place orders. Successful execution and persistence do not establish complete exchange-session coverage; inspect the report's coverage status and limitations. `.env.example` remains a credential-free template; paper trading defaults to enabled, and live trading defaults to disabled.
 
 ## 11. Guiding Rule
 

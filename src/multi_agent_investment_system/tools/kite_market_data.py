@@ -10,13 +10,14 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from io import StringIO
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from multi_agent_investment_system.core.configuration import KiteConnectCredentials
 from multi_agent_investment_system.core.exceptions import (
     DataValidationError,
+    MarketDataErrorCategory,
     MarketDataProviderError,
 )
 from multi_agent_investment_system.tools.kite_authentication import KiteAccessToken
@@ -90,7 +91,8 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
         for candle in candles:
             if not isinstance(candle, list) or len(candle) > 7:
                 raise MarketDataProviderError(
-                    "Kite historical data response contained a malformed candle"
+                    "Kite historical data response contained a malformed candle",
+                    category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
                 )
 
             record: dict[str, object] = {
@@ -104,11 +106,13 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
                     observed_at = datetime.fromisoformat(str(candle[0]))
                 except ValueError:
                     raise MarketDataProviderError(
-                        "Kite historical data response contained an invalid timestamp"
+                        "Kite historical data response contained an invalid timestamp",
+                        category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
                     ) from None
                 if observed_at.tzinfo is None or observed_at.utcoffset() is None:
                     raise MarketDataProviderError(
-                        "Kite historical data response contained an invalid timestamp"
+                        "Kite historical data response contained an invalid timestamp",
+                        category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
                     )
                 if not start <= observed_at.date() <= end:
                     continue
@@ -136,7 +140,8 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
         token = self._instrument_tokens.get(symbol)
         if token is None:
             raise MarketDataProviderError(
-                "NSE trading symbol was not found in the Kite instrument list"
+                "NSE trading symbol was not found in the Kite instrument list",
+                category=MarketDataErrorCategory.INSTRUMENT_RESOLUTION_ERROR,
             )
         return token
 
@@ -161,12 +166,14 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
                 matches.setdefault(trading_symbol, []).append(int(token_text))
         except (UnicodeDecodeError, csv.Error, OSError, ValueError):
             raise MarketDataProviderError(
-                "Kite NSE instrument list response was malformed"
+                "Kite NSE instrument list response was malformed",
+                category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
             ) from None
 
         if any(len(tokens) != 1 for tokens in matches.values()):
             raise MarketDataProviderError(
-                "Kite NSE instrument list contained ambiguous equity symbols"
+                "Kite NSE instrument list contained ambiguous equity symbols",
+                category=MarketDataErrorCategory.INSTRUMENT_RESOLUTION_ERROR,
             )
         return {symbol: tokens[0] for symbol, tokens in matches.items()}
 
@@ -186,7 +193,8 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
             ValueError,
         ):
             raise MarketDataProviderError(
-                "Kite historical data response was malformed or unsuccessful"
+                "Kite historical data response was malformed or unsuccessful",
+                category=MarketDataErrorCategory.INVALID_PROVIDER_RESPONSE,
             ) from None
 
     async def _request_bytes(self, url: str) -> bytes:
@@ -212,11 +220,26 @@ class KiteConnectMarketDataProvider(MarketDataProvider):
                 return await asyncio.to_thread(self._read_response, request)
             except HTTPError as error:
                 raise MarketDataProviderError(
-                    f"Kite market-data request failed with HTTP status {error.code}"
+                    f"Kite market-data request failed with HTTP status {error.code}",
+                    retryable=error.code == 429 or 500 <= error.code < 600,
+                    category=MarketDataErrorCategory.HTTP_ERROR,
+                    http_status=error.code,
+                ) from None
+            except (TimeoutError, ConnectionError):
+                raise MarketDataProviderError(
+                    "Kite market-data request failed",
+                    retryable=True,
+                    category=MarketDataErrorCategory.NETWORK_OR_TIMEOUT,
+                ) from None
+            except URLError:
+                raise MarketDataProviderError(
+                    "Kite market-data request failed",
+                    category=MarketDataErrorCategory.NETWORK_OR_TIMEOUT,
                 ) from None
             except Exception:
                 raise MarketDataProviderError(
-                    "Kite market-data request failed"
+                    "Kite market-data request failed",
+                    category=MarketDataErrorCategory.UNEXPECTED_EXTRACTION_ERROR,
                 ) from None
             finally:
                 self._last_request_at = time.monotonic()

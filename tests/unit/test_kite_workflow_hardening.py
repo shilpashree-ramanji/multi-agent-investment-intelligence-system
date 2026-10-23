@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -48,6 +49,23 @@ from multi_agent_investment_system.tools.kite_symbol_guard import (
     RequestedSymbolGuard,
 )
 from multi_agent_investment_system.tools.market_data import MarketDataProvider
+
+
+def _coordinator_plan(action: str, task_id: str = "task-a") -> str:
+    condition = (
+        "quality_clean_and_persisted"
+        if action in {"collect_range", "retry_collection"}
+        else "stop_without_coverage_claim"
+    )
+    return json.dumps(
+        {
+            "action": action,
+            "task_id": task_id,
+            "reason": f"Observed state supports {action}",
+            "expected_outcome": "A bounded, inspectable result",
+            "completion_condition": condition,
+        }
+    )
 
 
 def _request(**overrides: object) -> KiteIngestionRequest:
@@ -158,8 +176,8 @@ def test_kite_symbol_mismatch_fails_before_sqlite_persistence(tmp_path) -> None:
     )
     coordinator = CoordinatorAgent(
         _Model(
-            '{"action":"delegate_ingestion","task_id":"task-a"}',
-            '{"action":"escalate"}',
+            _coordinator_plan("collect_range"),
+            _coordinator_plan("escalate"),
         ),
         worker,
         policy,
@@ -227,8 +245,8 @@ def test_successful_empty_response_keeps_coverage_unknown(tmp_path) -> None:
     )
     coordinator = CoordinatorAgent(
         _Model(
-            '{"action":"delegate_ingestion","task_id":"task-a"}',
-            '{"action":"complete"}',
+            _coordinator_plan("collect_range"),
+            _coordinator_plan("complete"),
         ),
         worker,
         policy,
@@ -241,6 +259,8 @@ def test_successful_empty_response_keeps_coverage_unknown(tmp_path) -> None:
     assert state.worker_result.counts is not None
     assert state.worker_result.counts.fetched == 0
     assert state.worker_result.coverage_status is KiteCoverageStatus.UNKNOWN
+    assert state.final_observation is not None
+    assert state.final_observation.stored_dates == ()
     assert set(state.worker_result.coverage_reasons) == {
         KiteCoverageReason.NO_TRADING_CALENDAR,
         KiteCoverageReason.NO_PROVIDER_COVERAGE_GUARANTEE,

@@ -158,7 +158,8 @@ class SQLiteDailyCandleStore:
         try:
             rows = connection.execute(
                 """
-                SELECT symbol, observed_at, open, high, low, close, volume,
+                SELECT symbol, trading_date, observed_at, open, high, low, close,
+                       volume,
                        source, retrieved_at, source_metadata_json
                 FROM daily_ohlcv
                 WHERE symbol = ? AND trading_date >= ? AND trading_date <= ?
@@ -177,6 +178,7 @@ class SQLiteDailyCandleStore:
             record.update(
                 {
                     "symbol": row["symbol"],
+                    "trading_date": date.fromisoformat(row["trading_date"]),
                     "observed_at": datetime.fromisoformat(row["observed_at"]),
                     "open": Decimal(row["open"]),
                     "high": Decimal(row["high"]),

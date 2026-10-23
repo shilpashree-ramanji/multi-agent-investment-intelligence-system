@@ -12,16 +12,20 @@ from typing import Protocol, cast
 from multi_agent_investment_system.core.exceptions import (
     ConfigurationError,
     DataValidationError,
-    StockInvestmentError,
 )
 from multi_agent_investment_system.llm.provider import (
     ChatMessage,
+    ModelProviderDiagnostic,
+    ModelProviderError,
     ModelRequest,
     ModelResponse,
+    _safe_diagnostic_value,
 )
 
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
+_OPENAI_DIAGNOSTIC_ERROR_CODES = frozenset({"integer_below_min_value"})
+_OPENAI_DIAGNOSTIC_ERROR_TYPES = frozenset({"invalid_request_error"})
 _SUPPORTED_SCHEMA_TYPES = frozenset(
     {"string", "number", "integer", "boolean", "object", "array", "null"}
 )
@@ -50,12 +54,83 @@ _SUPPORTED_SCHEMA_KEYS = frozenset(
 )
 
 
-class OpenAIModelProviderError(StockInvestmentError):
+class OpenAIModelProviderError(ModelProviderError):
     """Sanitized error from an OpenAI request or response."""
 
-    def __init__(self, message: str, *, category: str) -> None:
-        super().__init__(message)
-        self.category = category
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        diagnostic: ModelProviderDiagnostic | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            category=category,
+            diagnostic=diagnostic
+            or ModelProviderDiagnostic.from_exception_class(type(self).__name__),
+        )
+
+
+def _safe_status(error: BaseException) -> int | None:
+    status = _safe_attribute(error, "status_code")
+    if status is None:
+        response = _safe_attribute(error, "response")
+        status = _safe_attribute(response, "status_code")
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def _safe_attribute(value: object, name: str) -> object | None:
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _safe_provider_identifier(
+    value: object, *, allowed_values: frozenset[str]
+) -> str | None:
+    safe_value = _safe_diagnostic_value(value)
+    if safe_value is None or safe_value not in allowed_values:
+        return None
+    return safe_value
+
+
+def _diagnostic_from_sdk_error(error: BaseException) -> ModelProviderDiagnostic:
+    """Extract only allowlisted SDK facts; never retain messages or payloads."""
+
+    exception_name = type(error).__name__
+    base = ModelProviderDiagnostic.from_exception_class(exception_name)
+    code = _safe_provider_identifier(
+        _safe_attribute(error, "code"),
+        allowed_values=_OPENAI_DIAGNOSTIC_ERROR_CODES,
+    )
+    error_type = _safe_provider_identifier(
+        _safe_attribute(error, "type"),
+        allowed_values=_OPENAI_DIAGNOSTIC_ERROR_TYPES,
+    )
+
+    # SDK API errors may expose structured error identifiers in a response body.
+    # Read only these two allowlisted scalar keys and discard the body immediately.
+    body = _safe_attribute(error, "body")
+    if isinstance(body, dict):
+        provider_error = body.get("error")
+        if isinstance(provider_error, dict):
+            code = code or _safe_provider_identifier(
+                provider_error.get("code"),
+                allowed_values=_OPENAI_DIAGNOSTIC_ERROR_CODES,
+            )
+            error_type = error_type or _safe_provider_identifier(
+                provider_error.get("type"),
+                allowed_values=_OPENAI_DIAGNOSTIC_ERROR_TYPES,
+            )
+
+    return ModelProviderDiagnostic(
+        exception_class=base.exception_class,
+        http_status=_safe_status(error),
+        provider_error_code=code,
+        provider_error_type=error_type,
+    )
 
 
 class _ResponsesEndpoint(Protocol):
@@ -265,24 +340,44 @@ class OpenAIModelProvider:
                 }
             }
 
+        request_failure: tuple[str, ModelProviderDiagnostic] | None = None
+        response: object | None = None
         try:
             response = await asyncio.wait_for(
                 self._client.responses.create(**payload),
                 timeout=self._timeout_seconds,
             )
-        except TimeoutError:
-            raise OpenAIModelProviderError(
-                "OpenAI request timed out", category="timeout"
-            ) from None
+        except TimeoutError as error:
+            request_failure = (
+                "timeout",
+                ModelProviderDiagnostic.from_exception_class(type(error).__name__),
+            )
         except Exception as error:
+            diagnostic = _diagnostic_from_sdk_error(error)
             if self._is_sdk_timeout(error):
-                raise OpenAIModelProviderError(
-                    "OpenAI request timed out", category="timeout"
-                ) from None
-            category = "sdk_error" if self._is_sdk_error(error) else "request_error"
+                request_failure = ("timeout", diagnostic)
+            else:
+                category = "sdk_error" if self._is_sdk_error(error) else "request_error"
+                request_failure = (category, diagnostic)
+
+        # Raise outside the except block so the sanitized error does not retain
+        # the raw SDK exception as implicit Python exception context.
+        if request_failure is not None:
+            category, diagnostic = request_failure
+            message = (
+                "OpenAI request timed out" if category == "timeout"
+                else "OpenAI request failed"
+            )
             raise OpenAIModelProviderError(
-                "OpenAI request failed", category=category
+                message, category=category, diagnostic=diagnostic
             ) from None
+
+        if response is None:
+            # A completed await must return a response object; keep this failure
+            # sanitized if a nonconforming injected client returns None.
+            raise OpenAIModelProviderError(
+                "OpenAI returned an unsuccessful response", category="response_error"
+            )
 
         status = getattr(response, "status", None)
         if status != "completed":

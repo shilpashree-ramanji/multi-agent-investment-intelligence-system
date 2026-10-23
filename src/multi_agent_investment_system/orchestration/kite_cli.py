@@ -30,7 +30,9 @@ from multi_agent_investment_system.llm.openai_provider import (
 from multi_agent_investment_system.orchestration.kite_ingestion import (
     KiteIngestionPolicy,
     KiteIngestionRequest,
+    KiteWorkflowErrorCode,
     KiteWorkflowStatus,
+    safe_action_trace_descriptions,
 )
 from multi_agent_investment_system.orchestration.kite_runtime import (
     build_kite_coordinator,
@@ -93,9 +95,8 @@ def _build_request(args: argparse.Namespace) -> KiteIngestionRequest:
 def _plan(
     configuration: _RuntimeConfiguration, request: KiteIngestionRequest, mode: str
 ) -> dict[str, object]:
-    request.validate_policy(
-        KiteIngestionPolicy(configuration.settings.maximum_calendar_days)
-    )
+    policy = KiteIngestionPolicy(configuration.settings.maximum_calendar_days)
+    request.validate_policy(policy)
     return {
         "mode": mode,
         "symbol": request.symbol,
@@ -104,7 +105,13 @@ def _plan(
         "maximum_calendar_days": configuration.settings.maximum_calendar_days,
         "database_target": configuration.settings.database_path.name,
         "model": configuration.model,
-        "expected_model_calls_per_successful_task": 3,
+        "maximum_coordinator_iterations": policy.maximum_iterations,
+        "maximum_collection_attempts": policy.maximum_collection_attempts,
+        "maximum_symbols": 1,
+        "maximum_kite_http_requests": policy.maximum_collection_attempts + 1,
+        "maximum_model_calls": (
+            policy.maximum_iterations + policy.maximum_collection_attempts
+        ),
         "coverage": (
             "Successful ingestion does not establish historical coverage; "
             "coverage remains unknown unless independently verified."
@@ -156,6 +163,24 @@ def _run_live(
     )
     state = asyncio.run(coordinator.run(request))
     worker_result = state.worker_result
+    counts = getattr(worker_result, "counts", None)
+    final_observation = getattr(state, "final_observation", None)
+    initial_observation = getattr(state, "initial_observation", None)
+    action_trace = getattr(state, "action_trace", ())
+    model_diagnostic = getattr(state, "model_provider_diagnostic", None)
+    if model_diagnostic is None and worker_result is not None:
+        model_diagnostic = getattr(
+            worker_result, "model_provider_diagnostic", None
+        )
+    market_data_diagnostic = (
+        getattr(worker_result, "market_data_diagnostic", None)
+        if worker_result is not None
+        else None
+    )
+    policy = KiteIngestionPolicy(configuration.settings.maximum_calendar_days)
+    attempt_counts = [
+        item.counts for item in action_trace if item.counts is not None
+    ]
     coverage_status = (
         worker_result.coverage_status.value
         if worker_result is not None
@@ -171,9 +196,153 @@ def _run_live(
             "mode": "live",
             "status": state.status.value,
             "error_code": state.error_code.value if state.error_code else None,
+            "model_provider_diagnostic": (
+                model_diagnostic.to_dict() if model_diagnostic is not None else None
+            ),
+            "market_data_diagnostic": (
+                {
+                    **market_data_diagnostic.to_dict(),
+                    "retryable": worker_result.retryable,
+                }
+                if market_data_diagnostic is not None
+                else None
+            ),
+            "requested": {
+                "symbol": request.symbol,
+                "start": request.start.isoformat(),
+                "end": request.end.isoformat(),
+            },
+            "counts": {
+                "fetched_across_attempts": sum(item.fetched for item in attempt_counts),
+                "valid_across_attempts": sum(item.valid for item in attempt_counts),
+                "incomplete_across_attempts": sum(
+                    item.incomplete for item in attempt_counts
+                ),
+                "invalid_across_attempts": sum(
+                    item.invalid for item in attempt_counts
+                ),
+                "upsert_operations_across_attempts": sum(
+                    item.upserted for item in attempt_counts
+                ),
+                "stored": counts.stored if counts is not None else 0,
+            },
+            "coverage_observed_dates": (
+                [item.isoformat() for item in final_observation.stored_dates]
+                if final_observation is not None
+                else []
+            ),
+            "initial_coverage_dates": (
+                [item.isoformat() for item in initial_observation.stored_dates]
+                if initial_observation is not None
+                else []
+            ),
+            "newly_covered_dates": (
+                sorted(
+                    set(item.isoformat() for item in final_observation.stored_dates)
+                    - set(item.isoformat() for item in initial_observation.stored_dates)
+                )
+                if final_observation is not None and initial_observation is not None
+                else []
+            ),
+            "coverage_quality": (
+                {
+                    "valid": final_observation.valid_count,
+                    "incomplete": final_observation.incomplete_count,
+                    "invalid": final_observation.invalid_count,
+                }
+                if final_observation is not None
+                else None
+            ),
+            "missing_sessions": "not_assessed_no_exchange_calendar",
+            "unresolved_gaps": "not_assessed_no_exchange_calendar",
+            "duplicate_records": "not_measured_by_current_ingestion_result",
+            "duplicate_storage_behavior": (
+                "SQLite upserts by symbol and trading date; repeated provider rows "
+                "for one date are not separately counted"
+            ),
             "coverage_status": coverage_status,
             "coverage_reasons": coverage_reasons,
-            "expected_model_calls_per_successful_task": 3,
+            "source_error_code": (
+                getattr(worker_result, "error_code", None).value
+                if worker_result is not None
+                and getattr(worker_result, "error_code", None)
+                is KiteWorkflowErrorCode.MARKET_DATA_ERROR
+                else None
+            ),
+            "source_error_codes": sorted(
+                {
+                    item.outcome_code
+                    for item in action_trace
+                    if item.outcome_code
+                    == KiteWorkflowErrorCode.MARKET_DATA_ERROR.value
+                }
+            ),
+            "remaining_limitations": [
+                "No exchange trading calendar is configured",
+                "The Kite provider has no verified historical coverage guarantee",
+                "Duplicate provider rows within one response are not counted "
+                "separately",
+            ],
+            "actions": [
+                {
+                    "iteration": item.iteration,
+                    "action": item.action.value,
+                    "reason": safe_action_trace_descriptions(item.action)[0],
+                    "expected_outcome": safe_action_trace_descriptions(item.action)[
+                        1
+                    ],
+                    "authorized": item.authorized,
+                    "executed": item.executed,
+                    "outcome_code": item.outcome_code,
+                    "rejection_category": (
+                        item.rejection_category.value
+                        if getattr(item, "rejection_category", None) is not None
+                        else None
+                    ),
+                    "counts": (
+                        {
+                            "fetched": item.counts.fetched,
+                            "valid": item.counts.valid,
+                            "incomplete": item.counts.incomplete,
+                            "invalid": item.counts.invalid,
+                            "upserted": item.counts.upserted,
+                            "stored": item.counts.stored,
+                        }
+                        if item.counts is not None
+                        else None
+                    ),
+                }
+                for item in action_trace
+            ],
+            "proposed_actions": [item.action.value for item in action_trace],
+            "authorized_actions": [
+                item.action.value for item in action_trace if item.authorized
+            ],
+            "executed_actions": [
+                item.action.value for item in action_trace if item.executed
+            ],
+            "rejected_actions": [
+                item.outcome_code for item in action_trace if not item.authorized
+            ],
+            "retry_count": sum(
+                item.action.value == "retry_collection" and item.executed
+                for item in action_trace
+            ),
+            "execution_and_persistence_verified": state.status
+            is KiteWorkflowStatus.COMPLETED,
+            "full_requested_session_coverage_verified": False,
+            "completion_criteria_satisfied": False,
+            "recommended_next_action": (
+                "verify exchange-session coverage when an authorized calendar "
+                "is available"
+                if coverage_status == "unknown"
+                else "review the sanitized workflow error"
+            ),
+            "maximum_model_calls": (
+                policy.maximum_iterations + policy.maximum_collection_attempts
+            ),
+            "maximum_symbols": 1,
+            "maximum_kite_http_requests": policy.maximum_collection_attempts + 1,
         }
     )
     return 0 if state.status is KiteWorkflowStatus.COMPLETED else 1

@@ -8,8 +8,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from multi_agent_investment_system.core.exceptions import (
+    MarketDataErrorCategory,
+    MarketDataProviderDiagnostic,
+)
+from multi_agent_investment_system.llm.provider import (
+    ModelOutputRejectionCategory,
+    ModelProviderDiagnostic,
+)
 from multi_agent_investment_system.orchestration import kite_cli
 from multi_agent_investment_system.orchestration.kite_ingestion import (
+    KiteCollectionAction,
     KiteCoverageReason,
     KiteCoverageStatus,
     KiteWorkflowStatus,
@@ -60,7 +69,7 @@ def test_safe_modes_do_not_construct_clients_or_open_database(
     assert output["network_calls"] == 0
     assert output["openai_api_calls"] == 0
     assert output["zerodha_api_calls"] == 0
-    assert output["expected_model_calls_per_successful_task"] == 3
+    assert output["maximum_model_calls"] == 7
     assert "coverage" in output
     assert output["database_target"] == "market.sqlite3"
     assert all(
@@ -255,6 +264,10 @@ def test_live_composition_injects_provider_and_reports_unknown_coverage(
     )
     provider = object()
     observed: dict[str, object] = {}
+    hostile_model_text = (
+        "fake_api_key_value fake_access_token_value "
+        "Authorization: Bearer fake_header_value prompt-response-body-sentinel"
+    )
 
     class _Coordinator:
         async def run(self, live_request):
@@ -262,6 +275,24 @@ def test_live_composition_injects_provider_and_reports_unknown_coverage(
             return SimpleNamespace(
                 status=KiteWorkflowStatus.ESCALATED,
                 error_code=None,
+                model_provider_diagnostic=ModelProviderDiagnostic(
+                    exception_class="APIStatusError",
+                    http_status=400,
+                    provider_error_code="invalid_request_error",
+                    provider_error_type="invalid_request_error",
+                ),
+                action_trace=(
+                    SimpleNamespace(
+                        iteration=1,
+                        action=KiteCollectionAction.COLLECT_RANGE,
+                        reason=hostile_model_text,
+                        expected_outcome=hostile_model_text,
+                        authorized=True,
+                        executed=True,
+                        outcome_code="records_classified_and_storage_read_back",
+                        counts=None,
+                    ),
+                ),
                 worker_result=SimpleNamespace(
                     coverage_status=KiteCoverageStatus.UNKNOWN,
                     coverage_reasons=(
@@ -295,10 +326,141 @@ def test_live_composition_injects_provider_and_reports_unknown_coverage(
     assert observed["request"].symbol == "INFY"
     assert observed["request"].run_id != "input-run"
     assert observed["request"].task_id != "input-task"
-    output = json.loads(capsys.readouterr().out)
+    serialized_output = capsys.readouterr().out
+    output = json.loads(serialized_output)
     assert output["coverage_status"] == "unknown"
-    assert output["expected_model_calls_per_successful_task"] == 3
+    assert output["model_provider_diagnostic"] == {
+        "exception_class": "APIStatusError",
+        "http_status": 400,
+        "provider_error_code": "invalid_request_error",
+        "provider_error_type": "invalid_request_error",
+    }
+    assert output["maximum_model_calls"] == 7
+    assert output["full_requested_session_coverage_verified"] is False
+    assert output["missing_sessions"] == "not_assessed_no_exchange_calendar"
+    assert output["full_requested_session_coverage_verified"] is False
+    assert output["missing_sessions"] == "not_assessed_no_exchange_calendar"
+    assert hostile_model_text not in serialized_output
+    action_report = output["actions"][0]
+    assert action_report["action"] == "collect_range"
+    assert action_report["authorized"] is True
+    assert action_report["executed"] is True
+    assert action_report["outcome_code"] == "records_classified_and_storage_read_back"
+    assert action_report["reason"] == "A bounded collection action was authorized."
     assert "test-access-token" not in repr(observed)
+
+
+def test_live_report_includes_only_fixed_model_rejection_category(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _configure_environment(monkeypatch, tmp_path)
+    configuration = kite_cli._load_configuration()
+    request = kite_cli.KiteIngestionRequest(
+        "input-run", "input-task", "INFY", date(2025, 1, 1), date(2025, 1, 2)
+    )
+    raw_model_output = 'malformed fake_api_key prompt and response contents "'
+
+    class _Coordinator:
+        async def run(self, live_request):
+            return SimpleNamespace(
+                status=KiteWorkflowStatus.FAILED,
+                error_code=kite_cli.KiteWorkflowErrorCode.INVALID_MODEL_OUTPUT,
+                model_provider_diagnostic=None,
+                action_trace=(
+                    SimpleNamespace(
+                        iteration=1,
+                        action=KiteCollectionAction.REJECTED_MODEL_OUTPUT,
+                        reason=raw_model_output,
+                        expected_outcome=raw_model_output,
+                        authorized=False,
+                        executed=False,
+                        outcome_code="unsupported_or_malformed_model_action",
+                        rejection_category=ModelOutputRejectionCategory.INVALID_JSON,
+                        counts=None,
+                    ),
+                ),
+                worker_result=None,
+                initial_observation=None,
+                final_observation=None,
+            )
+
+    monkeypatch.setattr(kite_cli.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(kite_cli, "OpenAIModelProvider", lambda **kwargs: object())
+    monkeypatch.setattr(
+        kite_cli, "build_kite_coordinator", lambda **kwargs: _Coordinator()
+    )
+
+    result = kite_cli._run_live(configuration, request)
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert result == 1
+    assert output["error_code"] == "invalid_model_output"
+    assert output["actions"][0]["rejection_category"] == "invalid_json"
+    assert raw_model_output not in captured.out
+
+
+def test_live_report_includes_sanitized_market_data_diagnostic(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _configure_environment(monkeypatch, tmp_path)
+    configuration = kite_cli._load_configuration()
+    request = kite_cli.KiteIngestionRequest(
+        "input-run", "input-task", "INFY", date(2025, 1, 1), date(2025, 1, 2)
+    )
+    sensitive_text = "private response body fake-token authorization header"
+    market_diagnostic = MarketDataProviderDiagnostic(
+        MarketDataErrorCategory.HTTP_ERROR, 403
+    )
+
+    class _Coordinator:
+        async def run(self, live_request):
+            return SimpleNamespace(
+                status=KiteWorkflowStatus.ESCALATED,
+                error_code=kite_cli.KiteWorkflowErrorCode.MARKET_DATA_ERROR,
+                model_provider_diagnostic=None,
+                action_trace=(
+                    SimpleNamespace(
+                        iteration=1,
+                        action=KiteCollectionAction.COLLECT_RANGE,
+                        reason=sensitive_text,
+                        expected_outcome=sensitive_text,
+                        authorized=True,
+                        executed=True,
+                        outcome_code="market_data_error",
+                        counts=None,
+                    ),
+                ),
+                worker_result=SimpleNamespace(
+                    error_code=kite_cli.KiteWorkflowErrorCode.MARKET_DATA_ERROR,
+                    retryable=False,
+                    market_data_diagnostic=market_diagnostic,
+                    coverage_status=KiteCoverageStatus.NOT_ASSESSED,
+                    coverage_reasons=(KiteCoverageReason.EXECUTION_NOT_SUCCESSFUL,),
+                    counts=None,
+                ),
+                initial_observation=None,
+                final_observation=None,
+            )
+
+    monkeypatch.setattr(kite_cli.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(kite_cli, "OpenAIModelProvider", lambda **kwargs: object())
+    monkeypatch.setattr(
+        kite_cli, "build_kite_coordinator", lambda **kwargs: _Coordinator()
+    )
+
+    result = kite_cli._run_live(configuration, request)
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert result == 1
+    assert output["error_code"] == "market_data_error"
+    assert output["market_data_diagnostic"] == {
+        "category": "http_error",
+        "http_status": 403,
+        "retryable": False,
+    }
+    assert sensitive_text not in captured.out
 
 
 def test_configuration_errors_do_not_print_secret_values(monkeypatch, capsys) -> None:

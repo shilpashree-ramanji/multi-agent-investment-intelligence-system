@@ -6,7 +6,11 @@ from decimal import Decimal
 
 import pytest
 
-from multi_agent_investment_system.core.exceptions import DataValidationError
+from multi_agent_investment_system.core.exceptions import (
+    DataValidationError,
+    MarketDataErrorCategory,
+    MarketDataProviderDiagnostic,
+)
 from multi_agent_investment_system.data.schemas import MarketObservation
 from multi_agent_investment_system.main import main
 
@@ -30,6 +34,22 @@ def test_market_observation_accepts_aware_timestamp() -> None:
     )
 
     assert observation.close == Decimal("10.25")
+
+
+def test_market_data_diagnostic_uses_fixed_category_allowlist() -> None:
+    diagnostic = MarketDataProviderDiagnostic("untrusted_category")
+
+    assert diagnostic.category is MarketDataErrorCategory.UNEXPECTED_EXTRACTION_ERROR
+    assert diagnostic.to_dict() == {"category": "unexpected_extraction_error"}
+
+
+@pytest.mark.parametrize("status", [True, 99, 600, "503", None])
+def test_market_data_diagnostic_omits_invalid_http_status(status) -> None:
+    diagnostic = MarketDataProviderDiagnostic(
+        MarketDataErrorCategory.HTTP_ERROR, status
+    )
+
+    assert diagnostic.to_dict() == {"category": "http_error"}
 
 
 def test_cli_reports_initialized_without_external_services(

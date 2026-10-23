@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +11,7 @@ from multi_agent_investment_system.core.exceptions import (
     ConfigurationError,
     DataValidationError,
 )
+from multi_agent_investment_system.llm import openai_provider
 from multi_agent_investment_system.llm.openai_provider import (
     DEFAULT_OPENAI_MODEL,
     OpenAIModelProvider,
@@ -154,15 +154,15 @@ def test_missing_api_key_is_actionable(monkeypatch) -> None:
 
 
 def test_missing_optional_sdk_is_actionable_without_network(monkeypatch) -> None:
-    original_import = builtins.__import__
+    original_import = openai_provider.importlib.import_module
 
-    def without_openai(name, *args, **kwargs):
+    def without_openai(name, package=None):
         if name == "openai":
             raise ImportError("test simulates optional SDK absence")
-        return original_import(name, *args, **kwargs)
+        return original_import(name, package)
 
     monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
-    monkeypatch.setattr(builtins, "__import__", without_openai)
+    monkeypatch.setattr(openai_provider.importlib, "import_module", without_openai)
 
     with pytest.raises(ConfigurationError, match="optional 'openai' dependency"):
         OpenAIModelProvider()
@@ -227,6 +227,121 @@ def test_sdk_failures_are_sanitized() -> None:
     assert error.value.category == "sdk_error"
     assert str(error.value) == "OpenAI request failed"
     assert "secret header" not in str(error.value)
+
+
+def test_sdk_failure_exposes_only_allowlisted_sanitized_diagnostics() -> None:
+    sensitive_values = (
+        "fake-api-key-secret",
+        "fake-access-token",
+        "private response body text",
+        "sensitive prompt content",
+        "fake-authorization-header",
+    )
+
+    class FakeAPIStatusError(Exception):
+        status_code = 400
+        code = None
+        type = None
+        response = SimpleNamespace(
+            status_code=400,
+            headers={"authorization": sensitive_values[-1]},
+        )
+        body = {
+            "error": {
+                "code": "integer_below_min_value",
+                "type": "invalid_request_error",
+                "message": sensitive_values[2],
+                "request": sensitive_values[0],
+            }
+        }
+
+    error_from_sdk = FakeAPIStatusError(
+        " ".join((*sensitive_values, "raw SDK message"))
+    )
+    provider = OpenAIModelProvider(client=_FakeClient(error=error_from_sdk))
+    provider._sdk_error_type = FakeAPIStatusError
+
+    with pytest.raises(OpenAIModelProviderError) as error:
+        asyncio.run(provider.generate(_request()))
+
+    diagnostic = error.value.diagnostic.to_dict()
+    assert error.value.category == "sdk_error"
+    assert diagnostic == {
+        "exception_class": "FakeAPIStatusError",
+        "http_status": 400,
+        "provider_error_code": "integer_below_min_value",
+        "provider_error_type": "invalid_request_error",
+    }
+    assert error.value.__context__ is None
+    assert error.value.__cause__ is None
+    rendered = repr(error.value) + repr(diagnostic)
+    assert all(secret not in rendered for secret in sensitive_values)
+    assert "raw SDK message" not in rendered
+
+
+def test_credential_shaped_provider_identifiers_are_omitted() -> None:
+    class FakeAPIStatusError(Exception):
+        status_code = 401
+        code = "fake_api_key_value"
+        type = "fake_access_token_value"
+        body = {
+            "error": {
+                "code": "fake_client_secret_value",
+                "type": "fake_bearer_token_value",
+                "message": "sensitive body text",
+            }
+        }
+
+    provider = OpenAIModelProvider(
+        client=_FakeClient(error=FakeAPIStatusError("private exception text"))
+    )
+    provider._sdk_error_type = FakeAPIStatusError
+
+    with pytest.raises(OpenAIModelProviderError) as error:
+        asyncio.run(provider.generate(_request()))
+
+    diagnostic = error.value.diagnostic.to_dict()
+    assert diagnostic == {
+        "exception_class": "FakeAPIStatusError",
+        "http_status": 401,
+    }
+    assert all(
+        secret not in repr(diagnostic) + str(error.value)
+        for secret in (
+            "fake_api_key_value",
+            "fake_access_token_value",
+            "fake_client_secret_value",
+            "fake_bearer_token_value",
+            "sensitive body text",
+            "private exception text",
+        )
+    )
+
+
+def test_unknown_provider_identifiers_are_omitted() -> None:
+    class FakeAPIStatusError(Exception):
+        status_code = 422
+        code = "unrecognized_provider_code"
+        type = "unrecognized_provider_error"
+        body = {
+            "error": {
+                "code": "another_unknown_code",
+                "type": "another_unknown_error",
+            }
+        }
+
+    provider = OpenAIModelProvider(
+        client=_FakeClient(error=FakeAPIStatusError("private provider text"))
+    )
+    provider._sdk_error_type = FakeAPIStatusError
+
+    with pytest.raises(OpenAIModelProviderError) as error:
+        asyncio.run(provider.generate(_request()))
+
+    assert error.value.diagnostic.to_dict() == {
+        "exception_class": "FakeAPIStatusError",
+        "http_status": 422,
+    }
 
 
 def test_injected_client_keeps_tests_offline_and_default_model_is_configurable(
